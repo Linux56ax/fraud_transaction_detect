@@ -15,8 +15,6 @@ from sklearn.metrics import (classification_report, precision_recall_curve,
 from sklearn.preprocessing import StandardScaler
 import pickle
 import zipfile
-from pathlib import Path
-from datetime import datetime
 import matplotlib.pyplot as plt
 import seaborn as sns
 import sys
