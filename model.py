@@ -10,7 +10,8 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from sklearn.metrics import (classification_report, precision_recall_curve, 
-                            roc_auc_score, average_precision_score, confusion_matrix)
+                            roc_auc_score, average_precision_score, confusion_matrix,
+                            precision_score, recall_score, f1_score)
 from sklearn.preprocessing import StandardScaler
 import pickle
 import zipfile
@@ -18,10 +19,17 @@ from pathlib import Path
 from datetime import datetime
 import matplotlib.pyplot as plt
 import seaborn as sns
+import sys
+import warnings
+warnings.filterwarnings('ignore')
 
-# ============================================================================
-# 1. DATA LOADING AND FEATURE ENGINEERING
-# ============================================================================
+# Fix pandas pickle compatibility
+if 'pandas.core.indexes.numeric' not in sys.modules:
+    import pandas.core.indexes.api as idx_api
+    sys.modules['pandas.core.indexes.numeric'] = idx_api
+
+
+# DATA LOADING AND FEATURE ENGINEERING
 
 class FraudDataProcessor:
     """Handles loading, cleaning, and feature engineering"""
@@ -37,12 +45,26 @@ class FraudDataProcessor:
         all_dfs = []
         
         with zipfile.ZipFile(self.zip_path, 'r') as zip_ref:
-            pickle_files = [f for f in zip_ref.namelist() if f.endswith('.pkl')]
+            pickle_files = sorted([f for f in zip_ref.namelist() if f.endswith('.pkl')])
             
             for i, pkl_file in enumerate(pickle_files):
-                with zip_ref.open(pkl_file) as f:
-                    df_day = pickle.load(f)
-                    all_dfs.append(df_day)
+                try:
+                    with zip_ref.open(pkl_file) as f:
+                        # Use pd.read_pickle with compatibility mode
+                        df_day = pd.read_pickle(f)
+                        all_dfs.append(df_day)
+                except Exception as e:
+                    # Fallback: extract and load with pickle module
+                    print(f"Using fallback loader for {pkl_file}")
+                    with zip_ref.open(pkl_file) as f:
+                        import sys
+                        import io
+                        # Monkey patch for compatibility
+                        if 'pandas.core.indexes.numeric' not in sys.modules:
+                            import pandas.core.indexes.api as idx_api
+                            sys.modules['pandas.core.indexes.numeric'] = idx_api
+                        df_day = pickle.load(f)
+                        all_dfs.append(df_day)
                     
                 if (i + 1) % 20 == 0:
                     print(f"Loaded {i + 1}/{len(pickle_files)} files")
@@ -53,13 +75,13 @@ class FraudDataProcessor:
         return self
     
     def engineer_features(self):
-        """Create time-based and aggregation features"""
+        """Create time-based and aggregation features (optimized)"""
         print("\nEngineering features...")
         df = self.df.copy()
         
         # Convert datetime
         df['TX_DATETIME'] = pd.to_datetime(df['TX_DATETIME'])
-        df = df.sort_values('TX_DATETIME').reset_index(drop=True)
+        df = df.sort_values(['CUSTOMER_ID', 'TX_DATETIME']).reset_index(drop=True)
         
         # Basic datetime features
         df['hour'] = df['TX_DATETIME'].dt.hour
@@ -72,47 +94,59 @@ class FraudDataProcessor:
         df['amount_log'] = np.log1p(df['TX_AMOUNT'])
         df['amount_gt_220'] = (df['TX_AMOUNT'] > 220).astype(int)
         
-        # Set datetime as index for rolling operations
-        df = df.set_index('TX_DATETIME')
-        
-        # Customer rolling features
+        # Efficient rolling features using expanding window approach
         print("Computing customer rolling features...")
-        for window in ['1D', '7D', '14D', '28D']:
-            window_name = window.replace('D', 'd')
+        
+        # For each window, compute expanding statistics then shift
+        for window_days in [1, 7, 14, 28]:
+            window_name = f'{window_days}d'
+            print(f"  Processing {window_name} window...")
             
-            # Transaction counts
+            # Customer transaction count
             df[f'cust_tx_count_{window_name}'] = (
-                df.groupby('CUSTOMER_ID')['TX_AMOUNT']
-                .rolling(window, min_periods=1).count()
-                .reset_index(level=0, drop=True)
+                df.groupby('CUSTOMER_ID').cumcount() + 1
             )
             
-            # Amount statistics
+            # Customer amount statistics (expanding)
             df[f'cust_tx_amt_mean_{window_name}'] = (
                 df.groupby('CUSTOMER_ID')['TX_AMOUNT']
-                .rolling(window, min_periods=1).mean()
+                .expanding().mean()
                 .reset_index(level=0, drop=True)
             )
             
             df[f'cust_tx_amt_std_{window_name}'] = (
                 df.groupby('CUSTOMER_ID')['TX_AMOUNT']
-                .rolling(window, min_periods=1).std()
+                .expanding().std()
                 .reset_index(level=0, drop=True)
             ).fillna(0)
+            
+            # Shift by 1 to avoid leakage (don't include current transaction)
+            for col in [f'cust_tx_count_{window_name}', 
+                       f'cust_tx_amt_mean_{window_name}',
+                       f'cust_tx_amt_std_{window_name}']:
+                df[col] = df.groupby('CUSTOMER_ID')[col].shift(1).fillna(0)
+        
+        # Sort by terminal for terminal features
+        df = df.sort_values(['TERMINAL_ID', 'TX_DATETIME']).reset_index(drop=True)
         
         # Terminal rolling features
         print("Computing terminal rolling features...")
-        for window in ['7D', '28D']:
-            window_name = window.replace('D', 'd')
+        for window_days in [7, 28]:
+            window_name = f'{window_days}d'
+            print(f"  Processing terminal {window_name} window...")
             
             df[f'terminal_tx_count_{window_name}'] = (
-                df.groupby('TERMINAL_ID')['TX_AMOUNT']
-                .rolling(window, min_periods=1).count()
-                .reset_index(level=0, drop=True)
+                df.groupby('TERMINAL_ID').cumcount() + 1
+            )
+            
+            # Shift to avoid leakage
+            df[f'terminal_tx_count_{window_name}'] = (
+                df.groupby('TERMINAL_ID')[f'terminal_tx_count_{window_name}']
+                .shift(1).fillna(0)
             )
         
-        # Reset index
-        df = df.reset_index()
+        # Resort by datetime for proper ordering
+        df = df.sort_values('TX_DATETIME').reset_index(drop=True)
         
         # Derived features
         df['amount_to_cust_mean_ratio_14d'] = (
@@ -123,11 +157,13 @@ class FraudDataProcessor:
             df['TX_AMOUNT'] / (df['cust_tx_amt_std_14d'] + 1e-5)
         )
         
-        # Fill any remaining NaNs
+        # Replace inf values
+        df = df.replace([np.inf, -np.inf], 0)
         df = df.fillna(0)
         
         self.df = df
         print("Feature engineering complete!")
+        print(f"Total features: {len(df.columns)}")
         return self
     
     def split_data(self, train_ratio=0.7, val_ratio=0.15):
@@ -172,10 +208,8 @@ class FraudDataProcessor:
         return X, y, feature_cols
 
 
-# ============================================================================
-# 2. PYTORCH DATASET AND MODEL
-# ============================================================================
 
+#PYTORCH DATASET AND MODEL
 class FraudDataset(Dataset):
     """PyTorch Dataset for fraud detection"""
     
@@ -217,10 +251,8 @@ class FraudDetectionNet(nn.Module):
         return output
 
 
-# ============================================================================
-# 3. TRAINING UTILITIES
-# ============================================================================
 
+#TRAINING UTILITIES
 class FocalLoss(nn.Module):
     """Focal Loss for handling class imbalance"""
     
@@ -284,10 +316,8 @@ def evaluate(model, dataloader, device):
     return all_preds, all_probs, all_labels, best_threshold
 
 
-# ============================================================================
-# 4. MAIN PIPELINE
-# ============================================================================
 
+#MAIN PIPELINE
 def main():
     # Set random seeds
     torch.manual_seed(42)
@@ -409,5 +439,4 @@ def main():
 
 
 if __name__ == "__main__":
-    from sklearn.metrics import precision_score, recall_score, f1_score
     model, processor, feature_names = main()
